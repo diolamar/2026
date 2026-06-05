@@ -111,9 +111,10 @@ Learning ON -> no history live-threshold tuning, but history gate/block/swap ana
 ->Update bug in random text is not changed when selecting other value
 ->Improve autotune function
 ->Added Safety valve for max skip-rate relaxer to avoid bet choking
--✅ Fixed – invalid windows with 10 cooldown rows are correctly rejected.
+->✅ Fixed – invalid windows with 10 cooldown rows are correctly rejected.
  ✅ Fixed – no recursion depth issues, even for max bet 16600.
-
+-Added max lose streak confiurable in GUI
+-Added Strategy builder, more strict in weak stages, 50 skips will looses auto-tune
 
 
 
