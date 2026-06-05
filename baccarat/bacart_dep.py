@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import json
+import os
 import random
 import sys
 import time
@@ -10,22 +12,34 @@ import tkinter as tk
 from dataclasses import dataclass, asdict
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, TextIO, Tuple
+from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
 from PIL import ImageGrab, ImageTk
 import pyautogui
 from tkinter import messagebox, ttk
 
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base_path / relative_path
+
+def writable_app_dir() -> Path:
+    """Return the folder where writable app files should live."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
 
 APP_TITLE = "Bacart 6x18 Calibrator"
-CONFIG_PATH = Path(__file__).resolve().parent / "bacart_calibration.json"
-SETTINGS_PATH = Path(__file__).resolve().parent / "bacart_settings.json"
-INFO_TEMPLATE_PATH = Path(__file__).resolve().parent / "bacart_calibration_info.txt"
-FILES_DIR = Path(__file__).resolve().parent / "files"
+APP_DIR = writable_app_dir()
+CONFIG_PATH = APP_DIR / "files" / "bacart_calibration.json"
+SETTINGS_PATH = APP_DIR / "files" / "bacart_settings.json"
+INFO_TEMPLATE_PATH = resource_path("bacart_calibration_info.txt")
+FILES_DIR = APP_DIR / "files"
 RESULTS_CSV_PATH = FILES_DIR / "results.csv"
 TERMINAL_LOG_PATH = FILES_DIR / "terminal.log"
 GRID_ROWS = 6
 GRID_COLS = 18
+HUMAN_CLICK_VARIANCE = 5  # pixels, random offset for PLR/BNR
 COLOR_NAMES = ("Blue", "Green", "Red")
 # Default settings (can be overridden by settings.json)
 DEFAULT_SETTINGS = {
@@ -101,10 +115,39 @@ class Color(Enum):
 
 
 # ---------- Logging ----------
-def append_terminal_log_line(message: str):
+def ensure_windows_console():
+    """Open a console for windowed Windows/PyInstaller builds."""
+    if os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        if kernel32.GetConsoleWindow():
+            return
+        if not kernel32.AttachConsole(-1):
+            kernel32.AllocConsole()
+        sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+        sys.stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+        sys.stdin = open("CONIN$", "r", encoding="utf-8")
+        sys.__stdout__ = sys.stdout
+        sys.__stderr__ = sys.stderr
+        sys.__stdin__ = sys.stdin
+    except Exception:
+        pass
+
+
+def append_terminal_log_line(message: str, echo_console: bool = True):
     FILES_DIR.mkdir(parents=True, exist_ok=True)
+    timestamped_message = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}"
     with TERMINAL_LOG_PATH.open("a", encoding="utf-8") as log_file:
-        log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        log_file.write(f"{timestamped_message}\n")
+    if echo_console:
+        stream = getattr(sys, "__stdout__", None)
+        if stream:
+            try:
+                stream.write(f"{timestamped_message}\n")
+                stream.flush()
+            except Exception:
+                pass
 
 
 class TerminalTee(TextIO):
@@ -120,13 +163,13 @@ class TerminalTee(TextIO):
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             if line.strip():
-                append_terminal_log_line(f"{self.prefix}{line}")
+                append_terminal_log_line(f"{self.prefix}{line}", echo_console=False)
         return written
 
     def flush(self):
         self.stream.flush()
         if self._buffer.strip():
-            append_terminal_log_line(f"{self.prefix}{self._buffer}")
+            append_terminal_log_line(f"{self.prefix}{self._buffer}", echo_console=False)
         self._buffer = ""
 
     def isatty(self) -> bool:
@@ -188,17 +231,104 @@ def grid_label(index: int) -> str:
     return f"R{row}C{col}"
 
 
+class RoundedBoardCell(tk.Canvas):
+    CELL_WIDTH = 30
+    CELL_HEIGHT = 26
+
+    def __init__(self, master: tk.Widget, label: str):
+        super().__init__(
+            master,
+            width=self.CELL_WIDTH,
+            height=self.CELL_HEIGHT,
+            bg="#f4efe6",
+            highlightthickness=0,
+            bd=0,
+        )
+        self.label = label
+        self.value = "Blank"
+        self.fill = "#ddd6c8"
+        self.foreground = "#2b2118"
+        self.hovered = False
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self._draw()
+
+    def set_result(self, value: str, fill: str, foreground: str):
+        self.value = value
+        self.fill = fill
+        self.foreground = foreground
+        self._draw()
+
+    def _on_enter(self, _event):
+        self.hovered = True
+        self._draw()
+
+    def _on_leave(self, _event):
+        self.hovered = False
+        self._draw()
+
+    def _draw_round_rect(self, x1: int, y1: int, x2: int, y2: int, radius: int, **kwargs):
+        points = [
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2, y2,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+            x1, y1,
+        ]
+        return self.create_polygon(points, smooth=True, **kwargs)
+
+    def _draw(self):
+        self.delete("all")
+        inset = 0 if self.hovered else 1
+        shadow = "#b6aa98" if self.hovered else "#cfc5b5"
+        width = self.CELL_WIDTH
+        height = self.CELL_HEIGHT
+        self._draw_round_rect(2, 3, width - 1, height - 1, 6, fill=shadow, outline="")
+        self._draw_round_rect(
+            inset,
+            inset,
+            width - inset,
+            height - inset,
+            6,
+            fill=self.fill,
+            outline="#ffffff" if self.value != "Blank" else "#b8afa0",
+            width=1,
+        )
+        font_size = 6 if self.hovered else 5
+        self.create_text(
+            width // 2,
+            9,
+            text=self.label,
+            fill=self.foreground,
+            font=("Arial", font_size, "bold"),
+        )
+        self.create_text(
+            width // 2,
+            19,
+            text=self.value,
+            fill=self.foreground,
+            font=("Arial", font_size, "bold"),
+        )
+
+
 # ---------- Main Application ----------
 class BacartCalibratorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        window_width = 550
         screen_margin = 20
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
+        window_width = min(550, max(550, screen_width - (screen_margin * 2)))
         available_height = max(540, min(760, screen_height - (screen_margin * 2)))
-        x_offset = screen_width - window_width - screen_margin
+        x_offset = max(0, screen_width - window_width - screen_margin)
         y_offset = 0
         self.root.geometry(f"{window_width}x{available_height}+{x_offset}+{y_offset}")
         self.root.configure(bg="#f4efe6")
@@ -224,8 +354,7 @@ class BacartCalibratorApp:
 
         # Progression state for Fibonacci/D'Alembert
         self.current_bet_index = 0           # for Default progression (martingale-like)
-        self.fib_prev = 0                    # for Fibonacci: previous bet amount
-        self.fib_curr = 1                    # for Fibonacci: current bet amount
+        self.fib_index = 0                   # for Fibonacci progression position
         self.dalembert_current = 1           # for D'Alembert: current unit
 
         self.point_labels: List[str] = [grid_label(i) for i in range(GRID_ROWS * GRID_COLS)] + list(EXTRA_LABELS)
@@ -271,7 +400,12 @@ class BacartCalibratorApp:
         self.resolved_bet_count = 0
         self.last_bet_progression_index = 0
         self.click_after_ids: List[str] = []  # For staggered clicks
+        self.marker_after_ids: List[str] = []
+        self.marker_windows: List[tk.Toplevel] = []
+        self.bet_click_in_progress = False
         self.cooldown_skip_active = False     # NEW: skip one round after loss streak
+        self.pattern_follow_skip_remaining = 0  # for pattern_follow strategy: rounds to skip after 6 losses
+        self.pattern_follow_skip_armed = False
 
         self.sample_radius_var = tk.IntVar(value=self.settings["sample_radius"])
         self.match_threshold_var = tk.DoubleVar(value=self.settings["match_threshold"])
@@ -331,14 +465,12 @@ class BacartCalibratorApp:
     def emergency_stop(self):
         """Keyboard shortcut to stop all automation and clear pending bet."""
         self.stop_monitor()
-        self.stop_auto_bet(reset_status=False)
-        self.stop_auto_sim(reset_status=False)
-        self.pending_bet_side = None
-        self.pending_bet_amount = 0
-        self.pending_bet_basis_len = -1
-        self.pending_bet_ready_at = 0.0
-        self.pending_bet_note = ""
+        self.stop_auto_bet(reset_status=False, force_clear_pending=True)
+        self.stop_auto_sim(reset_status=False, force_clear_pending=True)
+        self._clear_pending_bet()
         self.bet_waiting_for_reset = False
+        self.pattern_follow_skip_remaining = 0
+        self.pattern_follow_skip_armed = False
         self._set_status("EMERGENCY STOP: All automation halted.")
         self._log_audit("emergency_stop")
         self._update_stats_display()
@@ -360,25 +492,26 @@ class BacartCalibratorApp:
         toolbar = ttk.Frame(self.main_frame, padding=10)
         toolbar.pack(fill="x")
 
+        # Row 1: Calibration & Configuration
         button_row_top = ttk.Frame(toolbar)
-        button_row_top.pack(fill="x", anchor="w")
-        tk.Button(button_row_top, text="Calibrate", command=self.start_calibration, bg="#d97706", fg="white", width=10).pack(side="left", padx=4, pady=(0, 4))
-        tk.Button(button_row_top, text="Save", command=self._save_config, bg="#2563eb", fg="white", width=8).pack(side="left", padx=4, pady=(0, 4))
-        tk.Button(button_row_top, text="Load", command=self._load_config, bg="#0891b2", fg="white", width=8).pack(side="left", padx=4, pady=(0, 4))
-        tk.Button(button_row_top, text="Clear", command=self.clear_points, bg="#6b7280", fg="white", width=8).pack(side="left", padx=4, pady=(0, 4))
-        tk.Button(button_row_top, text="Settings", command=self._open_settings_dialog, bg="#4b5563", fg="white", width=8).pack(side="left", padx=4, pady=(0, 4))
-        tk.Button(button_row_top, text="Exit", command=self._exit_app, bg="#dc2626", fg="white", width=8).pack(side="left", padx=4, pady=(0, 4))
+        button_row_top.pack(fill="x", anchor="w", pady=(0, 4))
+        tk.Button(button_row_top, text="Calibrate", command=self.start_calibration, bg="#d97706", fg="white", width=12).pack(side="left", padx=4)
+        tk.Button(button_row_top, text="Show Area", command=self.show_calibrated_areas, bg="#0284c7", fg="white", width=10).pack(side="left", padx=4)
+        tk.Button(button_row_top, text="Recalibrate Point", command=self.recalibrate_point, bg="#b45309", fg="white", width=14).pack(side="left", padx=4)
+        tk.Button(button_row_top, text="Settings", command=self._open_settings_dialog, bg="#4b5563", fg="white", width=10).pack(side="left", padx=4)
+        tk.Button(button_row_top, text="Reset Stats", command=self.reset_stats, bg="#6b21a5", fg="white", width=10).pack(side="left", padx=4)
 
+        # Row 2: Scanning & Automation
         button_row_bottom = ttk.Frame(toolbar)
         button_row_bottom.pack(fill="x", anchor="w")
-        tk.Button(button_row_bottom, text="Scan Once", command=self.scan_once, bg="#7c3aed", fg="white", width=10).pack(side="left", padx=4, pady=(0, 4))
+        tk.Button(button_row_bottom, text="Scan Once", command=self.scan_once, bg="#7c3aed", fg="white", width=10).pack(side="left", padx=4)
         self.monitor_btn = tk.Button(button_row_bottom, text="Start Monitor", command=self.toggle_monitor, bg="#15803d", fg="white", width=12)
-        self.monitor_btn.pack(side="left", padx=4, pady=(0, 4))
+        self.monitor_btn.pack(side="left", padx=4)
         self.auto_btn = tk.Button(button_row_bottom, text="Start Auto", command=self.toggle_auto_bet, bg="#1d4ed8", fg="white", width=10)
-        self.auto_btn.pack(side="left", padx=4, pady=(0, 4))
+        self.auto_btn.pack(side="left", padx=4)
         self.autosim_btn = tk.Button(button_row_bottom, text="Start AutoSim", command=self.toggle_auto_sim, bg="#0f766e", fg="white", width=12)
-        self.autosim_btn.pack(side="left", padx=4, pady=(0, 4))
-        tk.Button(button_row_bottom, text="Recalibrate Point", command=self.recalibrate_point, bg="#b45309", fg="white", width=14).pack(side="left", padx=4, pady=(0, 4))
+        self.autosim_btn.pack(side="left", padx=4)
+        tk.Button(button_row_bottom, text="Exit", command=self._exit_app, bg="#dc2626", fg="white", width=8).pack(side="left", padx=4)
 
         settings_row = ttk.Frame(toolbar)
         settings_row.pack(fill="x", anchor="w")
@@ -444,15 +577,15 @@ class BacartCalibratorApp:
         ttk.Label(stats, textvariable=self.analysis_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
         ttk.Label(stats, textvariable=self.risk_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
 
-        board_container = ttk.Frame(self.main_frame, padding=10)
+        board_container = ttk.Frame(self.main_frame, padding=(4, 6, 4, 8))
         board_container.pack(fill="x", anchor="nw")
 
         board = tk.LabelFrame(
             board_container,
             text="Board 6 x 18",
             bg="#f4efe6",
-            padx=8,
-            pady=8,
+            padx=4,
+            pady=6,
         )
         board.pack(fill="x", anchor="nw")
 
@@ -482,20 +615,8 @@ class BacartCalibratorApp:
         for row in range(GRID_ROWS):
             for col in range(GRID_COLS):
                 label = f"R{row + 1}C{col + 1}"
-                cell = tk.Label(
-                    board_grid,
-                    text=label,
-                    width=6,
-                    height=2,
-                    relief="ridge",
-                    bd=1,
-                    bg="#ddd6c8",
-                    fg="#2b2118",
-                    font=("Arial", 6, "bold"),
-                    justify="center",
-                    anchor="center",
-                )
-                cell.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+                cell = RoundedBoardCell(board_grid, label)
+                cell.grid(row=row, column=col, padx=0, pady=0, sticky="nsew")
                 self.grid_frame_labels[label] = cell
                 self.grid_value_labels[label] = cell
 
@@ -657,10 +778,10 @@ class BacartCalibratorApp:
     def _reset_progression_state(self):
         """Reset progression index and internal counters when changing settings."""
         self.current_bet_index = 0
-        self.fib_prev = 0
-        self.fib_curr = 1
+        self.fib_index = 0
         self.dalembert_current = 1
         self.cooldown_skip_active = False
+        self.pattern_follow_skip_armed = False
 
     def _build_progression_steps_for_type(self, progression_type: str) -> List[int]:
         """Build the visible/active progression values for the selected progression type."""
@@ -696,11 +817,8 @@ class BacartCalibratorApp:
             idx = min(self.current_bet_index, len(self.progression_steps) - 1)
             return self.progression_steps[idx]
         elif self.progression_type == "Fibonacci":
-            # FIX: Safer Fibonacci step lookup using nearest value instead of exact index
-            target = self.fib_curr * self._base_progression_unit()
-            # Find closest step (or floor) to avoid ValueError
-            closest_idx = min(range(len(self.progression_steps)), key=lambda i: abs(self.progression_steps[i] - target))
-            return self.progression_steps[closest_idx]
+            idx = min(self.fib_index, len(self.progression_steps) - 1)
+            return self.progression_steps[idx]
         elif self.progression_type == "D'Alembert":
             idx = min(self.dalembert_current - 1, len(self.progression_steps) - 1)
             return self.progression_steps[idx]
@@ -714,7 +832,7 @@ class BacartCalibratorApp:
                 return 0
             return min(self.current_bet_index, len(self.progression_steps) - 1)
         if self.progression_type == "Fibonacci":
-            return self.fib_curr
+            return self.fib_index
         if self.progression_type == "D'Alembert":
             return self.dalembert_current
         return 0
@@ -728,19 +846,9 @@ class BacartCalibratorApp:
                 self.current_bet_index = min(self.current_bet_index + 1, len(self.progression_steps) - 1)
         elif self.progression_type == "Fibonacci":
             if won:
-                # Move two steps back
-                new_prev = max(0, self.fib_prev - self.fib_curr)
-                new_curr = max(1, self.fib_prev)
-                self.fib_prev, self.fib_curr = new_prev, new_curr
-                # Ensure minimum 1
-                if self.fib_curr < 1:
-                    self.fib_curr = 1
-                if self.fib_prev < 0:
-                    self.fib_prev = 0
+                self.fib_index = max(0, self.fib_index - 2)
             else:
-                # Move one step forward
-                next_val = self.fib_prev + self.fib_curr
-                self.fib_prev, self.fib_curr = self.fib_curr, next_val
+                self.fib_index = min(self.fib_index + 1, len(self.progression_steps) - 1)
         elif self.progression_type == "D'Alembert":
             if won:
                 self.dalembert_current = max(1, self.dalembert_current - 1)
@@ -914,8 +1022,8 @@ class BacartCalibratorApp:
 
     def _recalibrate_single_point(self, label: str):
         self.stop_monitor()
-        self.stop_auto_bet(reset_status=False)
-        self.stop_auto_sim(reset_status=False)
+        self.stop_auto_bet(reset_status=False, force_clear_pending=True)
+        self.stop_auto_sim(reset_status=False, force_clear_pending=True)
         self._close_overlay()
         self.root.iconify()
         self.root.update_idletasks()
@@ -965,13 +1073,13 @@ class BacartCalibratorApp:
         self.root.lift()
         self._refresh_progress()
         self._set_status(f"Recalibrated {label} at ({event.x_root}, {event.y_root})")
-        self._save_config()
+        self._save_config()   # Auto-save after recalibration
 
     # ---------- Calibration (unchanged) ----------
     def start_calibration(self):
         self.stop_monitor()
-        self.stop_auto_bet(reset_status=False)
-        self.stop_auto_sim(reset_status=False)
+        self.stop_auto_bet(reset_status=False, force_clear_pending=True)
+        self.stop_auto_sim(reset_status=False, force_clear_pending=True)
         self._log_audit("calibration_started", total_points=len(self.point_labels))
         self.capture_index = 0
         self._close_overlay()
@@ -1024,6 +1132,7 @@ class BacartCalibratorApp:
             self._refresh_progress()
             self._set_status("Calibration complete.")
             self._log_audit("calibration_completed", total_points=len(self.points))
+            self._save_config()   # Auto-save after full calibration
             return
 
         current_label = self.point_labels[self.capture_index]
@@ -1278,6 +1387,50 @@ class BacartCalibratorApp:
     def _has_pending_bet(self) -> bool:
         return bool(self.pending_bet_side)
 
+    def _set_pending_bet(self, side: str, amount: int, basis_len: int, note: str, ready_at: float):
+        self.pending_bet_side = side
+        self.pending_bet_amount = amount
+        self.pending_bet_basis_len = basis_len
+        self.pending_bet_note = note
+        self.pending_bet_ready_at = ready_at
+
+    def _clear_pending_bet(self):
+        self.pending_bet_side = None
+        self.pending_bet_amount = 0
+        self.pending_bet_basis_len = -1
+        self.pending_bet_note = ""
+        self.pending_bet_ready_at = 0.0
+
+    def _cancel_click_sequence(self):
+        for after_id in self.click_after_ids:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self.click_after_ids = []
+        self.bet_click_in_progress = False
+
+    def _cancel_sim_markers(self):
+        for after_id in self.marker_after_ids:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self.marker_after_ids = []
+        for marker in self.marker_windows:
+            try:
+                marker.destroy()
+            except Exception:
+                pass
+        self.marker_windows = []
+
+    def _mark_round_slot_handled(self, current_basis_len: int):
+        """Prevent a skipped/handled basis from receiving a later bet."""
+        if current_basis_len <= 0:
+            return
+        self.last_logged_sequence_len = max(self.last_logged_sequence_len, current_basis_len)
+        self.last_bet_basis_len = current_basis_len
+
     def _guard_auto_mode_switch(self, target_label: str) -> bool:
         current_label = None
         if self.auto_betting and target_label != "Auto":
@@ -1348,16 +1501,6 @@ class BacartCalibratorApp:
                 bg="#e5e7eb",
                 fg="#374151",
             )
-
-    def clear_points(self):
-        self.stop_monitor()
-        self.stop_auto_bet(reset_status=False)
-        self.stop_auto_sim(reset_status=False)
-        self.points.clear()
-        self._refresh_progress()
-        self._reset_board_display()
-        self.cd_var.set("CD Area: N/A")
-        self._set_status("Cleared all calibration points.")
 
     # ---------- Color Classification ----------
     def _require_points(self) -> bool:
@@ -1453,11 +1596,11 @@ class BacartCalibratorApp:
 
     def _class_color(self, value: str) -> Tuple[str, str]:
         if value == "Blue":
-            return "#dbeafe", "#1d4ed8"
+            return "#1d4ed8", "#ffffff"
         if value == "Green":
-            return "#dcfce7", "#15803d"
+            return "#15803d", "#ffffff"
         if value == "Red":
-            return "#fee2e2", "#b91c1c"
+            return "#b91c1c", "#ffffff"
         return "#e5e7eb", "#374151"
 
     def _set_named_status(self, label: str, text: str, value: str = "Blank"):
@@ -1516,15 +1659,6 @@ class BacartCalibratorApp:
 
         return False, ""
 
-    def _reset_board_display(self):
-        for label, widget in self.grid_value_labels.items():
-            bg, fg = self._class_color("Blank")
-            widget.configure(text=label, bg=bg, fg=fg)
-        for label in EXTRA_LABELS:
-            point = self.points.get(label)
-            text = f"{point.x}, {point.y}" if point else "Not set"
-            self._set_named_status(label, text, "Blank")
-
     def _capture_snapshot(self) -> Optional[ScanSnapshot]:
         if not self._require_points():
             return None
@@ -1582,11 +1716,15 @@ class BacartCalibratorApp:
         for index, value in enumerate(snapshot.board_values):
             label = grid_label(index)
             bg, fg = self._class_color(value)
-            self.grid_value_labels[label].configure(
-                text=f"{label}\n{value}",
-                bg=bg,
-                fg=fg,
-            )
+            widget = self.grid_value_labels[label]
+            if isinstance(widget, RoundedBoardCell):
+                widget.set_result(value, bg, fg)
+            else:
+                widget.configure(
+                    text=f"{label}\n{value}",
+                    bg=bg,
+                    fg=fg,
+                )
 
         self._set_named_status(
             "CD",
@@ -1620,10 +1758,8 @@ class BacartCalibratorApp:
         return plan
 
     def _click_point(self, label: str):
-        point = self.points.get(label)
-        if not point:
-            raise ValueError(f"Missing calibration for {label}")
-        pyautogui.click(point.x, point.y)
+        x, y = self._get_human_click_coordinates(label)
+        pyautogui.click(x, y)
 
     def _build_bet_click_sequence(self, side: str, amount: int) -> List[str]:
         plan = self._build_chip_plan(amount)
@@ -1634,32 +1770,49 @@ class BacartCalibratorApp:
                 sequence.append(side)
         return sequence
 
-    def _place_bet(self, side: str, amount: int):
+    def _place_bet(self, side: str, amount: int, on_complete: Optional[Callable[[], None]] = None):
         """Place bet using staggered clicks via after() to avoid blocking UI."""
         labels = self._build_bet_click_sequence(side, amount)
         self._log_audit("place_bet_click_sequence", mode="Auto", side=side, amount=amount, labels=labels)
-        self._staggered_clicks(labels)
+        self.bet_click_in_progress = True
+        self._staggered_clicks(labels, on_complete=on_complete)
 
-    def _staggered_clicks(self, labels: List[str], index: int = 0):
+    def _staggered_clicks(self, labels: List[str], index: int = 0, on_complete: Optional[Callable[[], None]] = None):
         """Perform clicks with delay between each."""
+        if not self.auto_betting:
+            self._cancel_click_sequence()
+            return
         if index >= len(labels):
             self.click_after_ids = []
+            self.bet_click_in_progress = False
+            if on_complete:
+                on_complete()
             return
         try:
             self._click_point(labels[index])
         except Exception as e:
+            self._cancel_click_sequence()
             self._set_status(f"Click error: {e}")
+            self._log_audit("place_bet_click_failed", label=labels[index], index=index, error=str(e))
             return
-        after_id = self.root.after(120, lambda: self._staggered_clicks(labels, index + 1))
+        if index >= len(labels) - 1:
+            self.click_after_ids = []
+            self.bet_click_in_progress = False
+            if on_complete:
+                on_complete()
+            return
+        after_id = self.root.after(120, lambda: self._staggered_clicks(labels, index + 1, on_complete))
         self.click_after_ids.append(str(after_id))
 
     def _show_click_sequence_markers(self, labels: List[str]):
         self._log_audit("place_bet_click_sequence", mode="AutoSim", labels=labels)
-        marker_windows = []
 
         def show_marker(index: int, label: str):
-            point = self.points.get(label)
-            if not point:
+            if not self.auto_sim_betting:
+                return
+            try:
+                x, y = self._get_human_click_coordinates(label)
+            except ValueError:
                 return
             marker = tk.Toplevel(self.root)
             marker.overrideredirect(True)
@@ -1669,7 +1822,7 @@ class BacartCalibratorApp:
                 marker.wm_attributes("-transparentcolor", "#ff00ff")
             except tk.TclError:
                 pass
-            marker.geometry(f"36x36+{max(0, point.x - 18)}+{max(0, point.y - 18)}")
+            marker.geometry(f"36x36+{max(0, x - 18)}+{max(0, y - 18)}")
             tk.Label(
                 marker,
                 text=str(index + 1),
@@ -1677,24 +1830,26 @@ class BacartCalibratorApp:
                 fg="#ff0000",
                 bg="#ff00ff",
             ).pack(fill="both", expand=True)
-            marker_windows.append(marker)
+            self.marker_windows.append(marker)
 
         for index, label in enumerate(labels):
-            self.root.after(index * 250, lambda idx=index, item=label: show_marker(idx, item))
+            after_id = self.root.after(index * 250, lambda idx=index, item=label: show_marker(idx, item))
+            self.marker_after_ids.append(str(after_id))
 
         total_delay = max(0, len(labels) - 1) * 250 + 12000
 
         def destroy_markers():
-            for marker in marker_windows:
-                try:
-                    marker.destroy()
-                except Exception:
-                    pass
+            self._cancel_sim_markers()
 
-        self.root.after(total_delay, destroy_markers)
+        after_id = self.root.after(total_delay, destroy_markers)
+        self.marker_after_ids.append(str(after_id))
 
     def _resolve_bet(self, result_value: str):
-        expected = {"PLR": "Blue", "BNR": "Red"}.get(self.pending_bet_side or "", "")
+        bet_side = self.pending_bet_side or ""
+        bet_amount = self.pending_bet_amount
+        basis_len = self.pending_bet_basis_len
+        pending_note = self.pending_bet_note
+        expected = {"PLR": "Blue", "BNR": "Red"}.get(bet_side, "")
         before_profit_total = self.profit_total
         before_progression_step = self._get_current_progression_step_value()
         self.total_rounds += 1
@@ -1707,44 +1862,44 @@ class BacartCalibratorApp:
             result_text = "TIE"
             # Progression unchanged (won = None handled later)
             won = None
+            self.pattern_follow_skip_remaining = 0
+            self.pattern_follow_skip_armed = False
         elif result_value == expected:
             self.win_count += 1
-            profit_change = self.pending_bet_amount
+            profit_change = bet_amount
             self.profit_total += profit_change
             self.current_loss_streak = 0
             result_text = "WIN"
             won = True
+            # Reset pattern_follow skip counter when a win occurs
+            if self.side_selection_strategy == "pattern_follow":
+                self.pattern_follow_skip_remaining = 0
+                self.pattern_follow_skip_armed = False
+            self.cooldown_skip_active = False   # only reset on win
         else:
             self.loss_count += 1
-            profit_change = -self.pending_bet_amount
+            profit_change = -bet_amount
             self.profit_total += profit_change
             self.current_loss_streak += 1
             self.max_loss_streak = max(self.max_loss_streak, self.current_loss_streak)
             result_text = "LOSE"
             won = False
+            if self.side_selection_strategy == "pattern_follow" and self.current_loss_streak >= 6:
+                self.pattern_follow_skip_armed = True
 
         # Update progression based on outcome (ignore ties)
         if result_value != "Green":
             self._update_progression_on_result(won)
 
-        # Stop loss checks
-        if self.stop_loss is not None and self.profit_total <= self.stop_loss:
-            self._set_status(f"FIXED STOP LOSS reached ({self.profit_total} <= {self.stop_loss}). Halting auto modes.")
-            self.emergency_stop()
-        if self._check_trailing_stop():
-            return
-        if self._check_profit_target():
-            return
-
         # FIX: Update last_logged_sequence_len after resolving a bet (prevents duplicate processing)
-        self.last_logged_sequence_len = self.pending_bet_basis_len + 1
+        self.last_logged_sequence_len = basis_len + 1
 
         self._refresh_risk_metrics()
         self._log_audit(
             "bet_resolved",
             event=result_text.lower(),
-            bet_side=self.pending_bet_side,
-            bet_amount=self.pending_bet_amount,
+            bet_side=bet_side,
+            bet_amount=bet_amount,
             expected=expected,
             result=result_value,
             profit_before=before_profit_total,
@@ -1756,7 +1911,6 @@ class BacartCalibratorApp:
             tie_count=self.tie_count,
             resolved_bets=self.resolved_bet_count,
         )
-        basis_len = self.pending_bet_basis_len
         if basis_len < 0 or basis_len >= GRID_ROWS * GRID_COLS:
             round_box_str = ""
         else:
@@ -1765,21 +1919,26 @@ class BacartCalibratorApp:
             result_text.lower(),
             round_box=round_box_str,
             progression_step=self._get_current_progression_step_value(),
-            bet_side=self.pending_bet_side or "",
-            bet_amount=self.pending_bet_amount,
+            bet_side=bet_side,
+            bet_amount=bet_amount,
             result=result_value,
-            note=self.pending_bet_note,
+            note=pending_note,
         )
         self._set_status(
-            f"Resolved {result_text}: {self.pending_bet_side} vs {result_value} | Profit {self.profit_total}"
+            f"Resolved {result_text}: {bet_side} vs {result_value} | Profit {self.profit_total}"
         )
-        self.pending_bet_side = None
-        self.pending_bet_amount = 0
-        self.pending_bet_basis_len = -1
-        self.pending_bet_note = ""
-        self.pending_bet_ready_at = 0.0
-        self.cooldown_skip_active = False  # reset cooldown after resolution
+        self._clear_pending_bet()
+        # Do NOT reset cooldown_skip_active here – it should only be cleared on win.
         self._update_stats_display()
+
+        if self.stop_loss is not None and self.profit_total <= self.stop_loss:
+            self.emergency_stop()
+            self._set_status(f"FIXED STOP LOSS reached ({self.profit_total} <= {self.stop_loss}). Halting auto modes.")
+            return
+        if self._check_trailing_stop():
+            return
+        if self._check_profit_target():
+            return
 
     def _handle_auto_logic(self, snapshot: ScanSnapshot):
         now = time.time()
@@ -1789,18 +1948,21 @@ class BacartCalibratorApp:
             self._update_stats_display()
             return
 
+        if self.bet_click_in_progress:
+            self._update_stats_display()
+            return
+
         if snapshot.all_blank:
             self.record_counter = 1
             self.last_logged_sequence_len = -1
             self.current_loss_streak = 0
-            self.pending_bet_side = None
-            self.pending_bet_amount = 0
-            self.pending_bet_basis_len = -1
-            self.pending_bet_note = ""
-            self.pending_bet_ready_at = 0.0
+            self._clear_pending_bet()
             self.last_bet_basis_len = -1
             self.bet_waiting_for_reset = False
+            self.bet_click_in_progress = False
             self.cooldown_skip_active = False
+            self.pattern_follow_skip_remaining = 0
+            self.pattern_follow_skip_armed = False
             self._set_status("Board reset detected: all cells blank.")
             self._update_stats_display()
             return
@@ -1824,6 +1986,7 @@ class BacartCalibratorApp:
         if self.bet_waiting_for_reset or current_basis_len >= LAST_BET_SEQUENCE_LEN:
             if has_new_result:
                 self.skip_count += 1
+                self._mark_round_slot_handled(current_basis_len)
                 self._append_record(
                     "skip",
                     round_box=self._result_box_label(current_basis_len - 1),
@@ -1842,17 +2005,9 @@ class BacartCalibratorApp:
             return
         if snapshot.cd_value != "Green":
             if has_new_result:
-                self.skip_count += 1
                 self._log_analysis(
-                    f"Skipped round at {self._result_box_label(current_basis_len - 1)} because CD was "
+                    f"Waiting at {self._result_box_label(current_basis_len - 1)} because CD was "
                     f"{snapshot.cd_value}, not Green. Sequence length={current_basis_len}."
-                )
-                self._append_record(
-                    "skip",
-                    round_box=self._result_box_label(current_basis_len - 1),
-                    progression_step=self._get_current_progression_step_value(),
-                    result=snapshot.sequence[-1],
-                    note=f"cd {snapshot.cd_value.lower()}",
                 )
             self._set_status(f"{mode_label} ready: waiting for CD green.")
             return
@@ -1864,10 +2019,11 @@ class BacartCalibratorApp:
         if self.current_loss_streak < self.loss_streak_cooldown:
             self.cooldown_skip_active = False
 
-        # Loss streak cooldown
-        if self.loss_streak_cooldown > 0 and self.current_loss_streak >= self.loss_streak_cooldown and not self.cooldown_skip_active:
+        # Loss streak cooldown: skip once when the streak first reaches the threshold.
+        if self.loss_streak_cooldown > 0 and self.current_loss_streak == self.loss_streak_cooldown and not self.cooldown_skip_active:
             self.cooldown_skip_active = True
             self.skip_count += 1
+            self._mark_round_slot_handled(current_basis_len)
             self._append_record(
                 "skip",
                 round_box=self._result_box_label(current_basis_len - 1),
@@ -1875,10 +2031,37 @@ class BacartCalibratorApp:
                 result=snapshot.sequence[-1],
                 note=f"loss streak {self.current_loss_streak} cooldown",
             )
-            self._set_status(f"Loss streak {self.current_loss_streak} >= {self.loss_streak_cooldown}, skipping one round.")
+            self._set_status(f"Loss streak reached {self.loss_streak_cooldown}, skipping one round.")
             self._update_stats_display()
             return
-        self.cooldown_skip_active = False
+        # (Do not reset cooldown_skip_active here; leave it True for the rest of the streak)
+
+        # Pattern-follow specific: after 6 consecutive losses, skip 3-5 rounds randomly.
+        # If losses continue after the skip block, another skip block is triggered.
+        if self.side_selection_strategy == "pattern_follow":
+            if (
+                self.current_loss_streak >= 6
+                and self.pattern_follow_skip_remaining == 0
+                and self.pattern_follow_skip_armed
+            ):
+                self.pattern_follow_skip_remaining = random.randint(3, 5)
+                self.pattern_follow_skip_armed = False
+                self._log_analysis(f"Pattern-follow: loss streak {self.current_loss_streak} >=6, skipping next {self.pattern_follow_skip_remaining} rounds.")
+            if self.pattern_follow_skip_remaining > 0:
+                self.skip_count += 1
+                remaining = self.pattern_follow_skip_remaining
+                self.pattern_follow_skip_remaining -= 1
+                self._mark_round_slot_handled(current_basis_len)
+                self._append_record(
+                    "skip",
+                    round_box=self._result_box_label(current_basis_len - 1),
+                    progression_step=self._get_current_progression_step_value(),
+                    result=snapshot.sequence[-1],
+                    note=f"pattern_follow streak skip ({remaining} left)",
+                )
+                self._set_status(f"Pattern-follow: skipping round ({remaining-1} more to go) due to 6+ loss streak.")
+                self._update_stats_display()
+                return
 
         # --- Decision with configured side-selection strategy ---
         side, analysis_reason = self._choose_bet_side_by_strategy(snapshot.sequence)
@@ -1917,22 +2100,34 @@ class BacartCalibratorApp:
             reason=analysis_reason,
         )
         click_sequence = self._build_bet_click_sequence(side, amount)
+
+        def mark_pending_bet():
+            self._set_pending_bet(
+                side,
+                amount,
+                current_basis_len,
+                self._brief_analysis_note(snapshot.sequence, side),
+                time.time() + self.auto_idle_seconds,
+            )
+            if self.auto_betting:
+                self._set_status(
+                    f"Auto bet placed: {side} / {amount}. Waiting {int(self.auto_idle_seconds)}s for result."
+                )
+            self._update_stats_display()
+
         try:
             if self.auto_sim_betting:
                 self._show_click_sequence_markers(click_sequence)
+                mark_pending_bet()
             else:
-                self._place_bet(side, amount)
+                self._place_bet(side, amount, on_complete=mark_pending_bet)
         except Exception as exc:
+            self.bet_click_in_progress = False
             self._set_status(f"{mode_label} failed: {exc}")
             return
         self.last_bet_side = side
         self.last_bet_amount = amount
         self.last_bet_progression_index = self._get_current_progression_step_value()
-        self.pending_bet_side = side
-        self.pending_bet_amount = amount
-        self.pending_bet_basis_len = current_basis_len
-        self.pending_bet_note = self._brief_analysis_note(snapshot.sequence, side)
-        self.pending_bet_ready_at = now + self.auto_idle_seconds
         self.last_bet_basis_len = current_basis_len
         if self.auto_sim_betting:
             self._set_status(
@@ -1940,7 +2135,7 @@ class BacartCalibratorApp:
             )
         else:
             self._set_status(
-                f"Auto bet placed: {side} / {amount}. Waiting {int(self.auto_idle_seconds)}s for result."
+                f"Auto bet clicking: {side} / {amount}."
             )
         self._update_stats_display()
 
@@ -2023,21 +2218,31 @@ class BacartCalibratorApp:
         if not self.monitor_after_id:
             self._monitor_tick()
 
-    def stop_auto_bet(self, reset_status: bool = True):
+    def stop_auto_bet(self, reset_status: bool = True, force_clear_pending: bool = False):
         self.auto_betting = False
         self.auto_btn.configure(text="Start Auto")
-        self.pending_bet_side = None
-        self.pending_bet_amount = 0
-        self.pending_bet_basis_len = -1
-        self.pending_bet_ready_at = 0.0
-        self.pending_bet_note = ""
+        self._cancel_click_sequence()
+        if force_clear_pending or not self.pending_bet_side:
+            self._clear_pending_bet()
         self.bet_waiting_for_reset = False
         self.cooldown_skip_active = False
+        self.pattern_follow_skip_remaining = 0
+        self.pattern_follow_skip_armed = False
         self._update_stats_display()
-        self._log_audit("mode_stopped", mode="Auto", reset_status=reset_status)
+        self._log_audit(
+            "mode_stopped",
+            mode="Auto",
+            reset_status=reset_status,
+            pending_preserved=bool(self.pending_bet_side),
+        )
         if reset_status:
-            self._set_status("Auto betting stopped.")
-        if self.monitor_after_id and not self.monitoring and not self.auto_sim_betting:
+            if self.pending_bet_side:
+                self._set_status("Auto betting stopped. Pending real bet will still be resolved.")
+            else:
+                self._set_status("Auto betting stopped.")
+        if self.pending_bet_side and not self.monitor_after_id:
+            self._monitor_tick()
+        if self.monitor_after_id and not self.monitoring and not self.auto_sim_betting and not self.pending_bet_side:
             try:
                 self.root.after_cancel(self.monitor_after_id)
             except Exception:
@@ -2068,21 +2273,31 @@ class BacartCalibratorApp:
         if not self.monitor_after_id:
             self._monitor_tick()
 
-    def stop_auto_sim(self, reset_status: bool = True):
+    def stop_auto_sim(self, reset_status: bool = True, force_clear_pending: bool = False):
         self.auto_sim_betting = False
         self.autosim_btn.configure(text="Start AutoSim")
-        self.pending_bet_side = None
-        self.pending_bet_amount = 0
-        self.pending_bet_basis_len = -1
-        self.pending_bet_ready_at = 0.0
-        self.pending_bet_note = ""
+        self._cancel_sim_markers()
+        if force_clear_pending or not self.pending_bet_side:
+            self._clear_pending_bet()
         self.bet_waiting_for_reset = False
         self.cooldown_skip_active = False
+        self.pattern_follow_skip_remaining = 0
+        self.pattern_follow_skip_armed = False
         self._update_stats_display()
-        self._log_audit("mode_stopped", mode="AutoSim", reset_status=reset_status)
+        self._log_audit(
+            "mode_stopped",
+            mode="AutoSim",
+            reset_status=reset_status,
+            pending_preserved=bool(self.pending_bet_side),
+        )
         if reset_status:
-            self._set_status("AutoSim stopped.")
-        if self.monitor_after_id and not self.monitoring and not self.auto_betting:
+            if self.pending_bet_side:
+                self._set_status("AutoSim stopped. Pending simulated bet will still be resolved.")
+            else:
+                self._set_status("AutoSim stopped.")
+        if self.pending_bet_side and not self.monitor_after_id:
+            self._monitor_tick()
+        if self.monitor_after_id and not self.monitoring and not self.auto_betting and not self.pending_bet_side:
             try:
                 self.root.after_cancel(self.monitor_after_id)
             except Exception:
@@ -2091,14 +2306,14 @@ class BacartCalibratorApp:
 
     def _monitor_tick(self):
         self.monitor_after_id = None
-        if not (self.monitoring or self.auto_betting or self.auto_sim_betting):
+        if not (self.monitoring or self.auto_betting or self.auto_sim_betting or self.pending_bet_side):
             return
         snapshot = self._capture_snapshot()
         if snapshot:
             self._render_snapshot(snapshot)
             if snapshot.invalid:
                 self._set_status(snapshot.invalid_reason)
-            elif self.auto_betting or self.auto_sim_betting:
+            elif self.auto_betting or self.auto_sim_betting or self.pending_bet_side:
                 self._handle_auto_logic(snapshot)
             elif self.monitoring:
                 self._set_status(
@@ -2154,6 +2369,29 @@ class BacartCalibratorApp:
 
     def _build_calibration_info_text(self) -> str:
         progression_text = ", ".join(str(step) for step in self.progression_steps)
+        current_config_text = (
+            "Current Config\n"
+            "--------------\n"
+            f"Writable files folder: {FILES_DIR}\n"
+            f"Calibration file: {CONFIG_PATH.name}\n"
+            f"Settings file: {SETTINGS_PATH.name}\n"
+            f"CSV log: {RESULTS_CSV_PATH.name}\n"
+            f"Terminal log: {TERMINAL_LOG_PATH.name}\n"
+            f"Calibrated points: {len(self.points)}/{len(self.point_labels)}\n"
+            f"Sample radius: {int(self.sample_radius_var.get())}\n"
+            f"Match threshold: {float(self.match_threshold_var.get()):.1f}\n"
+            f"Refresh ms: {int(self.refresh_ms_var.get())}\n"
+            f"Auto idle seconds: {float(self.auto_idle_seconds):.1f}\n"
+            f"Progression type: {self.progression_type}\n"
+            f"Progression steps: {progression_text}\n"
+            f"Max bet: {self.max_bet}\n"
+            f"Stop loss: {self.stop_loss}\n"
+            f"Trailing stop pct: {self.trailing_stop_pct}\n"
+            f"Profit target: {self.profit_target}\n"
+            f"Loss streak cooldown: {self.loss_streak_cooldown}\n"
+            f"Side strategy: {self.side_selection_strategy}\n"
+            f"Last window bet box: {LAST_BET_BOX_LABEL}\n\n"
+        )
         fallback_text = (
             "Calibration info file is missing.\n\n"
             f"Expected file: {INFO_TEMPLATE_PATH.name}\n"
@@ -2163,19 +2401,21 @@ class BacartCalibratorApp:
         try:
             template = INFO_TEMPLATE_PATH.read_text(encoding="utf-8")
         except OSError:
-            return fallback_text
-        return template.format(
+            return current_config_text + fallback_text
+        guide_text = template.format(
             auto_idle_seconds=int(self.auto_idle_seconds),
             last_bet_box_label=LAST_BET_BOX_LABEL,
+            progression_type=self.progression_type,
             progression_text=progression_text,
             results_csv_name=RESULTS_CSV_PATH.name,
             terminal_log_name=TERMINAL_LOG_PATH.name,
         )
+        return current_config_text + guide_text
 
     def _exit_app(self):
         self.stop_monitor()
-        self.stop_auto_bet(reset_status=False)
-        self.stop_auto_sim(reset_status=False)
+        self.stop_auto_bet(reset_status=False, force_clear_pending=True)
+        self.stop_auto_sim(reset_status=False, force_clear_pending=True)
         self.root.destroy()
 
     def _on_main_frame_configure(self, _event):
@@ -2189,8 +2429,98 @@ class BacartCalibratorApp:
         if delta:
             self.main_canvas.yview_scroll(delta, "units")
 
+    def _get_human_click_coordinates(self, label: str) -> Tuple[int, int]:
+        point = self.points.get(label)
+        if not point:
+            raise ValueError(f"Missing calibration for {label}")
+
+        x, y = point.x, point.y
+        # Only apply offset to the large betting buttons
+        if label in ("PLR", "BNR"):
+            offset = random.randint(-HUMAN_CLICK_VARIANCE, HUMAN_CLICK_VARIANCE)
+            x += offset
+            offset = random.randint(-HUMAN_CLICK_VARIANCE, HUMAN_CLICK_VARIANCE)
+            y += offset
+            # Keep within screen bounds (optional, prevents out-of-bounds clicks)
+            screen_width, screen_height = pyautogui.size()
+            x = max(0, min(x, screen_width - 1))
+            y = max(0, min(y, screen_height - 1))
+        return x, y
+
+    def reset_stats(self):
+        """Reset all profit and round counters for a fresh session."""
+        self.total_rounds = 0
+        self.win_count = 0
+        self.loss_count = 0
+        self.tie_count = 0
+        self.profit_total = 0
+        self.peak_profit_total = 0
+        self.max_drawdown = 0
+        self.current_loss_streak = 0
+        self.max_loss_streak = 0
+        self.resolved_bet_count = 0
+        self.skip_count = 0
+        self.record_counter = 1
+        self._clear_pending_bet()
+        self.last_bet_side = None
+        self.last_bet_amount = 0
+        self.cooldown_skip_active = False
+        self.bet_waiting_for_reset = False
+        self.pattern_follow_skip_remaining = 0
+        self.pattern_follow_skip_armed = False
+        self._reset_progression_state()
+        self._update_stats_display()
+        self._set_status("Statistics and profit reset for a fresh session.")
+        self._log_audit("stats_reset")
+
+    def show_calibrated_areas(self):
+        """Display all calibrated points as red dots on a frozen screen."""
+        if not self.points:
+            self._set_status("No calibration points to show. Please calibrate first.")
+            return
+
+        # Stop any ongoing automation to avoid interference
+        self.stop_monitor()
+        self.stop_auto_bet(reset_status=False, force_clear_pending=True)
+        self.stop_auto_sim(reset_status=False, force_clear_pending=True)
+
+        # Grab current screen
+        frozen_screen = ImageGrab.grab().convert("RGB")
+        overlay = tk.Toplevel(self.root)
+        overlay.attributes("-fullscreen", True)
+        overlay.attributes("-topmost", True)
+        overlay.configure(bg="#000000", cursor="arrow")
+
+        canvas = tk.Canvas(overlay, bg="#000000", highlightthickness=0, bd=0)
+        canvas.pack(fill="both", expand=True)
+
+        # Show frozen screenshot as background
+        bg_photo = ImageTk.PhotoImage(frozen_screen)
+        canvas.create_image(0, 0, image=bg_photo, anchor="nw")
+        canvas.image = bg_photo  # prevent garbage collection
+
+        # Draw a red dot and label for each calibrated point
+        for label, point in self.points.items():
+            x, y = point.x, point.y
+            # Draw a red circle (dot)
+            canvas.create_oval(x-5, y-5, x+5, y+5, fill="red", outline="white", width=1)
+            # Optionally show the point name near the dot
+            canvas.create_text(x+10, y-10, text=label, fill="yellow", anchor="w", font=("Arial", 9))
+
+        # Close button panel
+        panel = tk.Frame(overlay, bg="#111827", padx=18, pady=12)
+        panel.place(relx=0.5, rely=0.04, anchor="n")
+        tk.Label(panel, text="Calibrated Points Preview", fg="white", bg="#111827", font=("Arial", 14, "bold")).pack()
+        tk.Label(panel, text="Press Esc or click Close to exit", fg="#d1d5db", bg="#111827", font=("Arial", 10)).pack(pady=(4, 8))
+        tk.Button(panel, text="Close", command=overlay.destroy, bg="#ef4444", fg="white", width=12).pack()
+
+        # Bind Escape to close
+        overlay.bind("<Escape>", lambda e: overlay.destroy())
+        self._set_status("Showing calibrated areas. Press Esc to exit.")
+
 
 def main():
+    ensure_windows_console()
     setup_terminal_logging()
     sys.excepthook = log_unhandled_exception
     try:
