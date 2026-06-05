@@ -62,7 +62,6 @@ PROGRESSION_PROFILES: Dict[str, Tuple[int, ...]] = {
     "MartFib": (5, 15, 35, 75, 155, 315, 635, 1275, 2555, 3830, 6385, 10215, 16600),
 }
 
-
 APP_NAME = "AutoClickerPro"
 
 if os.name == "nt":
@@ -405,7 +404,7 @@ class AutomationEngine:
         self.bet_amount_steps = self._build_virtual_bet_steps(
             start=self.config.martingale_start,
             max_steps=self.config.martingale_max_steps,
-            flat_cap=self.config.max_bet_per_round,
+            flat_cap=self._effective_max_bet_per_round() or None,
             profile_name=self.config.strategy_progression_profile,
         )
         self.martingale_index = 0
@@ -446,6 +445,8 @@ class AutomationEngine:
         self.decision_stats = DecisionStats()
         self.learning_mode = self.config.adaptive_learning_enabled
         self.last_decision_time = 0.0
+        self.consecutive_strategy_skips = 0
+        self.skip_relief_applied_count = 0
         
         # Performance metrics
         self.start_time = time.time()
@@ -1106,12 +1107,27 @@ class AutomationEngine:
     def _advance_detected_round_count(self):
         self.detected_round_count += 1
 
+    def _effective_max_bet_per_round(self) -> int:
+        configured = int(self.config.max_bet_per_round or 0)
+        return max(5, configured) if configured > 0 else 0
+
+    def _effective_loss_limit(self) -> Optional[float]:
+        configured = self.config.loss_limit
+        if configured is None or configured <= 0:
+            return None
+        return float(configured)
+
+    def _effective_max_loss_streak(self) -> int:
+        return max(1, self.max_loss_streak)
+
     def _reset_progression(self):
         self.bet_mode = "martingale"
         self.martingale_index = 0
 
     def _get_current_target_amount(self) -> int:
-        return self.bet_amount_steps[self.martingale_index]
+        amount = self.bet_amount_steps[self.martingale_index]
+        effective_max = self._effective_max_bet_per_round()
+        return min(amount, effective_max) if effective_max > 0 else amount
 
     @staticmethod
     def _amount_band_for_target_amount(amount: Optional[int]) -> str:
@@ -1216,12 +1232,31 @@ class AutomationEngine:
                 )
     
     def _check_bet_limits(self, amount: int) -> bool:
-        if amount > self.config.max_bet_per_round:
-            self.state.update_status(f"Bet {amount} exceeds max {self.config.max_bet_per_round}")
+        effective_max_bet = self._effective_max_bet_per_round()
+        effective_loss_limit = self._effective_loss_limit()
+        effective_max_loss_streak = self._effective_max_loss_streak()
+
+        if self.loss_streak >= effective_max_loss_streak:
+            self.state.update_status(
+                f"Max loss streak reached after {self.loss_streak} consecutive losses "
+                f"(limit {effective_max_loss_streak})."
+            )
+            self._simulate_halted = True
+            self._stop_event.set()
+            return False
+
+        if effective_max_bet > 0 and amount > effective_max_bet:
+            self.state.update_status(f"Bet {amount} exceeds max {effective_max_bet}")
+            self._simulate_halted = True
+            self._stop_event.set()
             return False
         
-        if self.config.loss_limit and self.profit_total <= -self.config.loss_limit:
-            self.state.update_status(f"Loss limit reached: ${self.profit_total:.2f}")
+        if effective_loss_limit is not None and self.profit_total <= -effective_loss_limit:
+            self.state.update_status(
+                f"Loss limit reached ${self.profit_total:.2f} "
+                f"<= -${effective_loss_limit:.2f}"
+            )
+            self._simulate_halted = True
             self._stop_event.set()
             return False
         
@@ -1746,6 +1781,34 @@ class AutomationEngine:
             if thresholds["amount_band_blocked"] and not thresholds.get("amount_block_reason"):
                 thresholds["amount_block_reason"] = f"SKIP_BAND_{amount_band}"
 
+        if self.consecutive_strategy_skips >= 50 and not thresholds.get("amount_band_blocked", False):
+            relief_steps = min(3, 1 + ((self.consecutive_strategy_skips - 50) // 25))
+            thresholds["min_hit_probability"] = max(
+                0.40,
+                float(thresholds["min_hit_probability"]) - (0.015 * relief_steps),
+            )
+            thresholds["min_expected_value"] = max(
+                -0.02,
+                float(thresholds["min_expected_value"]) - (0.015 * relief_steps),
+            )
+            thresholds["min_probability_edge"] = max(
+                0.01,
+                float(thresholds["min_probability_edge"]) - (0.006 * relief_steps),
+            )
+            thresholds["min_probability_samples"] = max(
+                4,
+                int(thresholds["min_probability_samples"]) - min(2, relief_steps),
+            )
+            thresholds["board_weight"] = min(
+                0.75,
+                float(thresholds.get("board_weight", self.config.strategy_probability_board_weight)) + (0.03 * relief_steps),
+            )
+            thresholds["skip_relief_active"] = True
+            thresholds["skip_relief_steps"] = relief_steps
+        else:
+            thresholds["skip_relief_active"] = False
+            thresholds["skip_relief_steps"] = 0
+
         return thresholds
 
     def _build_compact_decision_reason(
@@ -1847,6 +1910,7 @@ class AutomationEngine:
         self.decision_stats.total_decisions += 1
         
         if chosen_color:
+            self.consecutive_strategy_skips = 0
             self.decision_stats.bets_placed += 1
             if decision.confidence_level == "HIGH":
                 self.decision_stats.high_conf_bets += 1
@@ -1855,6 +1919,7 @@ class AutomationEngine:
             else:
                 self.decision_stats.low_conf_bets += 1
         else:
+            self.consecutive_strategy_skips += 1
             self.decision_stats.bets_skipped += 1
         
         if len(self.decision_history) > 1000:
@@ -2282,6 +2347,8 @@ class AutomationEngine:
             thresholds=active_thresholds,
             runner_up=(probability_snapshot.get("second_model") or {}).get("color"),
         )
+        if active_thresholds.get("skip_relief_active"):
+            compact_reason = f"{compact_reason}|RELIEF{active_thresholds.get('skip_relief_steps', 0)}"
         
         decision_metadata = {
             "score": top_score,
@@ -2402,7 +2469,16 @@ class AutomationEngine:
             self.profit_total += profit_change
             result = "LOSE"
             
-            if self.loss_streak >= self.max_loss_streak:
+            effective_loss_limit = self._effective_loss_limit()
+            effective_max_loss_streak = self._effective_max_loss_streak()
+            if effective_loss_limit is not None and self.profit_total <= -effective_loss_limit:
+                pending_idle_shutdown_message = (
+                    f"{prefix}: loss limit reached "
+                    f"{self.profit_total:.2f} <= -{effective_loss_limit:.2f}. Status set to Idle."
+                )
+                self._simulate_halted = True
+                self._stop_event.set()
+            elif self.loss_streak >= effective_max_loss_streak:
                 if self._scheduled_idle_waiting_for_profit:
                     pending_idle_shutdown_message = (
                         f"{prefix}: max loss streak reached while waiting for soft idle recovery. Status set to Idle."
@@ -2412,7 +2488,9 @@ class AutomationEngine:
                         f"{prefix}: max loss streak reached while waiting for soft idle win-clear extension. Status set to Idle."
                     )
                 else:
-                    self.state.update_status(f" HALTED: {self.loss_streak} consecutive losses")
+                    self.state.update_status(
+                        f"HALTED: max loss streak reached after {self.loss_streak} consecutive losses"
+                    )
                     self._simulate_halted = True
                     self._stop_event.set()
             else:
@@ -2582,6 +2660,9 @@ class AutomationEngine:
             "active_regime": self.last_regime,
             "active_regime_reason": self.last_regime_reason,
             "regime_counts": dict(regime_counts),
+            "consecutive_strategy_skips": self.consecutive_strategy_skips,
+            "skip_relief_active": bool(active_thresholds.get("skip_relief_active", False)),
+            "skip_relief_steps": int(active_thresholds.get("skip_relief_steps", 0)),
         }
         
         if self.decision_stats.high_conf_win_rate < 0.45 and self.decision_stats.high_conf_bets > 20:
@@ -3180,6 +3261,9 @@ class AutomationEngine:
 
                 chosen_color, target_amount, _ = self._choose_next_bet(game_state)
                 if chosen_color:
+                    if not self._check_bet_limits(target_amount):
+                        self.state.state = AutomationState.IDLE
+                        break
                     self._record_simulated_bet(chosen_color, f"Bet {target_amount}", False)
                 else:
                     self._skip_pending_bet("SIMULATE")
@@ -3889,6 +3973,47 @@ class AutoClickerPro:
 
         return guarded, reasons
 
+    def _build_history_stage_strategy_updates(self, model: HistoryStrategyModel) -> Tuple[Dict[str, object], List[str]]:
+        updates: Dict[str, object] = {}
+        reasons: List[str] = []
+        if model.settled_bets < 80:
+            return updates, reasons
+
+        has_weak_deep = bool(model.dangerous_amounts)
+        losing_history = model.summed_profit < 0 or model.hit_rate < 0.47
+        if not has_weak_deep and not losing_history:
+            return updates, reasons
+
+        updates["strategy_probability_window"] = min(40, int(self.config.strategy_probability_window) + (4 if has_weak_deep else 2))
+        updates["strategy_probability_min_samples"] = min(12, int(self.config.strategy_probability_min_samples) + 1)
+        updates["strategy_min_hit_probability"] = min(
+            0.68,
+            float(self.config.strategy_min_hit_probability) + (0.035 if has_weak_deep else 0.02),
+        )
+        updates["strategy_min_expected_value"] = min(
+            0.20,
+            float(self.config.strategy_min_expected_value) + (0.025 if has_weak_deep else 0.015),
+        )
+        updates["strategy_min_probability_edge"] = min(
+            0.08,
+            float(self.config.strategy_min_probability_edge) + (0.012 if has_weak_deep else 0.006),
+        )
+        updates["strategy_probability_board_weight"] = max(
+            0.35,
+            float(self.config.strategy_probability_board_weight) - (0.05 if has_weak_deep else 0.025),
+        )
+
+        if has_weak_deep:
+            reasons.append(
+                "strategy builder weak deep stages "
+                + ", ".join(str(amount) for amount in model.dangerous_amounts[:4])
+            )
+        if losing_history:
+            reasons.append(
+                f"strategy builder losing history hit={model.hit_rate * 100:.1f}% profit={model.summed_profit:+.0f}"
+            )
+        return updates, reasons
+
     def _apply_history_strategy_model(self, model: HistoryStrategyModel):
         self._history_strategy_model = model
         self.engine.history_strategy_model = model
@@ -3897,6 +4022,8 @@ class AutoClickerPro:
             return
 
         updates = model.recommendation.to_config_updates()
+        builder_updates, builder_reasons = self._build_history_stage_strategy_updates(model)
+        updates.update(builder_updates)
         if not updates:
             self._history_strategy_applied_mtime = model.source_mtime
             return
@@ -3905,6 +4032,7 @@ class AutoClickerPro:
             self._history_strategy_applied_mtime = model.source_mtime
             return
         updates, guardrail_reasons = self._apply_history_strategy_guardrails(updates, model)
+        guardrail_reasons.extend(builder_reasons)
 
         candidate_data = self.config.to_dict()
         candidate_data.update(updates)
@@ -4013,7 +4141,7 @@ class AutoClickerPro:
         self.engine.bet_amount_steps = self.engine._build_virtual_bet_steps(
             start=self.config.martingale_start,
             max_steps=self.config.martingale_max_steps,
-            flat_cap=self.config.max_bet_per_round,
+            flat_cap=self.engine._effective_max_bet_per_round() or None,
             profile_name=self._normalized_progression_profile_name(),
         )
         self.engine.max_loss_streak = len(self.engine.bet_amount_steps)
@@ -4137,6 +4265,8 @@ class AutoClickerPro:
             self.strategy_board_weight_var.set(f"{float(self.config.strategy_probability_board_weight):.2f}")
             self.strategy_history_window_limit_var.set(str(int(self.config.strategy_history_window_limit)))
             self.strategy_scheduled_idle_lead_minutes_var.set(str(int(self.config.scheduled_idle_lead_minutes)))
+            if hasattr(self, "strategy_loss_streak_limit_var"):
+                self.strategy_loss_streak_limit_var.set(str(int(self.config.martingale_max_steps)))
         finally:
             self._strategy_profile_syncing = False
         self._refresh_strategy_custom_fields_visibility()
@@ -4164,7 +4294,8 @@ class AutoClickerPro:
             f"Samples>={self.config.strategy_probability_min_samples}\n"
             f"W={self.config.strategy_probability_window} | "
             f"HWin={'All' if self.config.strategy_history_window_limit <= 0 else self.config.strategy_history_window_limit} | "
-            f"Prog={self._normalized_progression_profile_name()} | SoftIdle={soft_idle_text}"
+            f"Prog={self._normalized_progression_profile_name()} | "
+            f"MaxLoss={self.config.martingale_max_steps} | SoftIdle={soft_idle_text}"
         )
 
     def _build_soft_idle_countdown_text(self) -> str:
@@ -4224,6 +4355,7 @@ class AutoClickerPro:
             f"- Window = {self.config.strategy_probability_window}",
             f"- Board Weight = {self.config.strategy_probability_board_weight:.2f}",
             f"- Progression Profile = {self._normalized_progression_profile_name()}",
+            f"- Max Loss Streak = {self.config.martingale_max_steps}",
             f"- History Windows = {'all complete windows' if self.config.strategy_history_window_limit <= 0 else self.config.strategy_history_window_limit}",
             f"- Soft Idle Minutes = {'off' if self.config.scheduled_idle_lead_minutes <= 0 else f'{self.config.scheduled_idle_lead_minutes} minutes'}",
             "- Soft idle starts after that many elapsed runtime minutes in the active live mode.",
@@ -4427,6 +4559,16 @@ class AutoClickerPro:
         else:
             scheduled_idle_entry.state(["disabled"])
 
+    def _refresh_loss_streak_limit_entry_state(self):
+        loss_streak_entry = getattr(self, "strategy_loss_streak_limit_entry", None)
+        if not loss_streak_entry:
+            return
+
+        if self._is_progression_profile_edit_allowed():
+            loss_streak_entry.state(["!disabled"])
+        else:
+            loss_streak_entry.state(["disabled"])
+
     def _refresh_history_trim_button_state(self):
         trim_canvas = getattr(self, "info_trim_canvas", None)
         trim_oval = getattr(self, "_info_trim_oval_id", None)
@@ -4464,6 +4606,7 @@ class AutoClickerPro:
         self._refresh_history_window_limit_entry_state()
         self._refresh_progression_profile_control_state()
         self._refresh_scheduled_idle_lead_entry_state()
+        self._refresh_loss_streak_limit_entry_state()
         self._refresh_history_trim_button_state()
 
     def _apply_custom_strategy_fields(self):
@@ -4580,6 +4723,39 @@ class AutoClickerPro:
         if hasattr(self, "status_var"):
             self.status_var.set(f"Status: Progression profile {selected}")
         logger.info("Progression profile set to %s", selected)
+
+    def _apply_loss_streak_limit_selection(self):
+        if getattr(self, "_strategy_profile_syncing", False):
+            return
+        if not self._is_progression_profile_edit_allowed():
+            self._populate_strategy_vars_from_config()
+            if hasattr(self, "status_var"):
+                self.status_var.set(
+                    "Status: Max loss streak can only be changed while idle, warmup, or cooldown"
+                )
+            return
+        try:
+            candidate_data = self.config.to_dict()
+            candidate_data["martingale_max_steps"] = int(self.strategy_loss_streak_limit_var.get().strip())
+            validated = AppConfig.from_dict(candidate_data)
+        except ValueError as exc:
+            messagebox.showerror("Invalid Max Loss Streak", str(exc))
+            self._populate_strategy_vars_from_config()
+            return
+        except Exception as exc:
+            messagebox.showerror("Invalid Max Loss Streak", f"Could not apply max loss streak: {exc}")
+            self._populate_strategy_vars_from_config()
+            return
+
+        self.config.martingale_max_steps = validated.martingale_max_steps
+        self.config_dirty = True
+        self._save_config()
+        self._rebuild_engine_progression_steps()
+        self.engine._save_session_state()
+        self._populate_strategy_vars_from_config()
+        if hasattr(self, "status_var"):
+            self.status_var.set(f"Status: Max loss streak set to {self.config.martingale_max_steps}")
+        logger.info("Max loss streak set to %s", self.config.martingale_max_steps)
 
     def _apply_scheduled_idle_lead_minutes_selection(self):
         if getattr(self, "_strategy_profile_syncing", False):
@@ -4813,7 +4989,7 @@ class AutoClickerPro:
             self._main_canvas.yview_scroll(delta, "units")
 
     def _setup_ui(self):
-        self.root.title("Booty Bot with Analytics v5.42")
+        self.root.title("Booty Bot with Analytics v5.43")
         window_width = 560
         desired_window_height = 636
         min_window_height = 540
@@ -4951,6 +5127,7 @@ class AutoClickerPro:
         self.strategy_board_weight_var = tk.StringVar(value=f"{self.config.strategy_probability_board_weight:.2f}")
         self.strategy_history_window_limit_var = tk.StringVar(value=str(self.config.strategy_history_window_limit))
         self.strategy_scheduled_idle_lead_minutes_var = tk.StringVar(value=str(self.config.scheduled_idle_lead_minutes))
+        self.strategy_loss_streak_limit_var = tk.StringVar(value=str(self.config.martingale_max_steps))
         self.strategy_soft_idle_due_var = tk.StringVar(value=self._build_soft_idle_countdown_text())
         self.strategy_cache_auto_clear_var = tk.StringVar(value=self._auto_cache_clear_status_text)
 
@@ -5043,19 +5220,22 @@ class AutoClickerPro:
         controls_row.columnconfigure(3, weight=0)
         controls_row.columnconfigure(4, weight=0)
         controls_row.columnconfigure(5, weight=0)
-        controls_row.columnconfigure(6, weight=1)
+        controls_row.columnconfigure(6, weight=0)
+        controls_row.columnconfigure(7, weight=0)
+        controls_row.columnconfigure(8, weight=0)
+        controls_row.columnconfigure(9, weight=1)
         self.strategy_custom_toggle_btn = ttk.Button(
             controls_row,
             text="Show Fields",
             command=self._toggle_strategy_custom_fields,
-            width=12,
+            width=10,
         )
-        self.strategy_custom_toggle_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(controls_row, text="Soft Idle Min:").grid(row=0, column=1, sticky="w", padx=(4, 6))
+        self.strategy_custom_toggle_btn.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Label(controls_row, text="Idle:").grid(row=0, column=1, sticky="w", padx=(2, 4))
         self.strategy_scheduled_idle_lead_entry = ttk.Entry(
             controls_row,
             textvariable=self.strategy_scheduled_idle_lead_minutes_var,
-            width=7,
+            width=5,
             justify="center",
         )
         self.strategy_scheduled_idle_lead_entry.grid(row=0, column=2, sticky="w")
@@ -5067,15 +5247,35 @@ class AutoClickerPro:
             "<FocusOut>",
             lambda _event: self._apply_scheduled_idle_lead_minutes_selection(),
         )
-        ttk.Label(controls_row, text="0 = off").grid(row=0, column=3, sticky="w", padx=(6, 0))
+        ttk.Label(controls_row, text="0=off |").grid(row=0, column=3, sticky="w", padx=(4, 4))
+        ttk.Label(controls_row, text="MaxLoss:").grid(row=0, column=4, sticky="w", padx=(0, 4))
+        self.strategy_loss_streak_limit_entry = ttk.Entry(
+            controls_row,
+            textvariable=self.strategy_loss_streak_limit_var,
+            width=4,
+            justify="center",
+        )
+        self.strategy_loss_streak_limit_entry.grid(row=0, column=5, sticky="w")
+        self.strategy_loss_streak_limit_entry.bind(
+            "<Return>",
+            lambda _event: self._apply_loss_streak_limit_selection(),
+        )
+        self.strategy_loss_streak_limit_entry.bind(
+            "<FocusOut>",
+            lambda _event: self._apply_loss_streak_limit_selection(),
+        )
+        ttk.Label(controls_row, text="|").grid(row=0, column=6, sticky="w", padx=(6, 4))
         ttk.Label(
             controls_row,
             textvariable=self.strategy_soft_idle_due_var,
-        ).grid(row=0, column=4, sticky="w", padx=(12, 0))
+            width=12,
+        ).grid(row=0, column=7, sticky="w", padx=(0, 0))
+        ttk.Label(controls_row, text="|").grid(row=0, column=8, sticky="w", padx=(4, 4))
         ttk.Label(
             controls_row,
             textvariable=self.strategy_cache_auto_clear_var,
-        ).grid(row=0, column=5, sticky="w", padx=(12, 0))
+            width=12,
+        ).grid(row=0, column=9, sticky="w", padx=(0, 0))
 
         self.strategy_summary_var = tk.StringVar(value=self._build_strategy_summary_text())
         ttk.Label(
@@ -5642,9 +5842,9 @@ Interpretation:
         self.rounds_var.set(f"Rounds: {self.engine.detected_round_count}")
         self.win_lose_var.set(f"Wins: {self.engine.win_count} | Loses: {self.engine.lose_count}")
         self.profit_var.set(f"Profit: {self.engine.profit_total:.2f}")
-        current_martingale = self.engine.bet_amount_steps[self.engine.martingale_index]
+        current_martingale = self.engine._get_current_target_amount()
         self.martingale_var.set(
-            f"Progression: {current_martingale} | Loss streak: {self.engine.loss_streak}/{self.engine.max_loss_streak}"
+            f"Progression: {current_martingale} | Loss streak: {self.engine.loss_streak}/{self.engine._effective_max_loss_streak()}"
         )
         self.current_bet_var.set(f"Current Bet: {current_bet}")
         self.pending_bet_var.set(f"Pending Bet: R{self.engine.pending_round_number} - {current_bet}")
