@@ -1,0 +1,120 @@
+Bacart 6x18 Calibrator Guide (Latest Version)
+
+This tool calibrates a 6 x 18 baccarat bead‑road style board, watches the live screen,
+classifies each box as Blue, Green, Red, or Blank, and can run assisted auto betting or
+visual auto simulation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Calibration Order
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The app records 108 grid points first, in column order:
+R1C1, R2C1 ... R6C1, then R1C2 ... through R6C18.
+After the grid, it captures these named points:
+PLR, BNR, Chip 10, Chip 50, Chip 100, Chip 250, Chip 1250,
+Sample Blue, Sample Green, Sample Red, and CD.
+
+- Sample Blue / Green / Red are the live reference colors used to classify the board.
+- CD is the gate signal for auto mode. Auto only acts when CD is detected as Green.
+
+Calibration is automatically saved after full calibration or when recalibrating a single point.
+No manual Save/Load buttons are needed – the app loads the last saved calibration on startup.
+The "Clear" button has been removed; use "Recalibrate Point" to fix individual points.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. Scan Logic
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Each scan samples the calibrated pixels from the current screen image.
+Every board box is compared against the three live sample colors.
+If no sample is close enough, that box is marked Blank.
+The visible result sequence stops at the first Blank.
+The last window bet box is R6C11.
+
+The app also rejects invalid boards, such as:
+- every box being detected as the same color
+- colored results appearing again after blanks
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. Modes & Buttons
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• Scan Once      – reads the board one time.
+• Start Monitor  – keeps scanning and updating the board display only.
+• Start Auto     – scans, analyzes, and places real clicks (with random offsets).
+• Start AutoSim  – runs the same analysis, but shows numbered click markers instead of real clicks.
+• Reset Stats    – clears all profit/round counters for a fresh session.
+• Show Area      – displays all calibrated points as red dots on a frozen screen (press Esc to close).
+• Settings       – configure progression, side strategy, stop loss, profit target, etc.
+• Exit           – closes the application.
+
+After a bet signal (real or simulated), the app waits about auto idle seconds before looking for the next result.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. Human‑like Clicking (Auto mode only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PLR and BNR buttons receive a random offset of ±5 pixels from the calibrated coordinates.
+This makes clicking more natural and avoids repetitive exact‑pixel clicking.
+Chip clicks remain exact (small buttons). AutoSim markers also show the offset positions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. Progression Systems
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Current progression type: {progression_type}
+Progression steps: {progression_text}
+
+- Default (Martingale‑like): step index increments on loss, resets to 0 on win.
+- Fibonacci: moves one step forward on loss, two steps back on win.
+- D'Alembert: increase one unit on loss, decrease one unit on win.
+
+Maximum bet limit is enforced (set in Settings).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. Side Selection Strategies
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The decision engine uses only decisive colors: Blue and Red.
+Green (tie) is ignored for side selection.
+
+Available strategies (choose in Settings):
+- follow_streak   : follow the latest decisive result (Blue → PLR, Red → BNR)
+- opposite_streak : bet opposite the latest decisive result
+- majority        : inspect the latest 6 decisive results and follow the majority color
+- alternate       : alternate PLR/BNR based on the count of decisive results
+- randomize       : choose randomly between PLR and BNR
+- follow_trend    : inspect the latest 5 decisive results and follow the leading color
+- pattern_follow  : detect zigzag and pair patterns (zigzags bet opposite, pairs follow)
+- weighted        : weighted moving average of up to 20 decisive results, more weight on recent
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. Pattern‑follow Special Behaviour (new)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When using pattern_follow strategy:
+- After 6 consecutive losses, the bot randomly skips the next 3–5 rounds.
+- If losses continue after the skip block, another random skip block is triggered.
+- As soon as a win occurs, the loss streak resets and skipping stops.
+This helps break long losing streaks and adds unpredictability.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. Risk Management
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All configurable in Settings:
+- Fixed Stop Loss   : stops automation when profit drops to or below this value
+- Trailing Stop %   : stops when profit drawdown from peak reaches this percentage
+- Profit Target     : stops when profit reaches or exceeds this value
+- Loss Streak Cooldown : after N consecutive losses, skip one round
+- Auto Idle Seconds : time to wait after placing a bet before checking the result
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. Logging
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CSV round log: results.csv (in the files folder)
+- Logs every bet, skip, win, loss, tie with timestamps, profit, progression step, hit rate.
+Terminal log: terminal.log (in the files folder)
+- Records status messages, exceptions, and ANALYSIS lines explaining skip/bet decisions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. Safety
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PyAutoGUI fail‑safe is enabled (move mouse to top‑left corner to abort).
+Real Auto mode clicks live screen coordinates, so calibration must match the exact target layout.
+If the table layout, resolution, zoom, or colors drift, recalibrate before using Auto.
+Press ESC anywhere to emergency‑stop all automation and clear pending bets.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
